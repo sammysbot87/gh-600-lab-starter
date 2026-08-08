@@ -1,9 +1,4 @@
-# ============================================================
-# Basic CI Pipeline (Starting Point)
-# This is a traditional CI pipeline WITHOUT agentic features.
-# Your exercise: Transform this into an agentic CI pipeline.
-# ============================================================
-name: Basic CI
+name: CI
 
 on:
   pull_request:
@@ -11,8 +6,11 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   build-and-test:
@@ -42,6 +40,16 @@ jobs:
 
       - name: Run Frontend Tests
         run: cd src/frontend && npm test
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-results
+          path: |
+            test-results/
+            src/frontend/coverage/
+          retention-days: 7
 
 
   # ---- Security Scanning  ----
@@ -134,14 +142,236 @@ jobs:
         run: echo "Skipping dependency review because this is a private repository without GitHub Code Security."
 
 
+  # ---- End-to-end tests (merge gate) ----
+  # Runs on every pull request against an API hosted on the runner.
+  # No Azure, no secrets, nothing deployed — so it can block a merge.
+  e2e-test:
+    needs: [build-and-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install Frontend Dependencies
+        run: cd src/frontend && npm ci
+
+      - name: Build Frontend
+        run: cd src/frontend && npm run build
+
+      - name: Install Playwright browser
+        run: cd src/frontend && npx playwright install --with-deps chromium
+
+      # No ConnectionStrings__TodoDb → in-memory store, no DB needed.
+      - name: Start the API
+        env:
+          ASPNETCORE_ENVIRONMENT: Development
+          Authentication__RequireSignedTokens: 'false'
+        run: |
+          set -uo pipefail
+          dotnet run --project src/api/TodoApi.csproj -c Release --urls http://127.0.0.1:5000 &
+          principal=$(printf '{"userId":"warmup"}' | base64 -w0)
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "x-ms-client-principal: ${principal}" \
+              http://127.0.0.1:5000/api/todo || true)
+            if [ "$code" = "200" ]; then echo "API ready after ${i}s."; exit 0; fi
+            sleep 1
+          done
+          echo "::error::API failed to start."; exit 1
+
+      - name: Start the test harness
+        env:
+          TEST_API_URL: http://127.0.0.1:5000
+        run: |
+          set -euo pipefail
+          node src/frontend/e2e/test-harness.mjs &
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:3000/ >/dev/null; then echo "Harness ready."; exit 0; fi
+            sleep 1
+          done
+          echo "::error::Harness failed to start."; exit 1
+
+      - name: Run Playwright
+        working-directory: src/frontend
+        env:
+          PLAYWRIGHT_EXTERNAL_SERVER: 'true'
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:3000
+        run: npx playwright test
+
+      - name: Capture the landing page
+        if: always()
+        working-directory: src/frontend
+        run: |
+          npx playwright screenshot --viewport-size=1280,800 --wait-for-timeout=1500 \
+            http://127.0.0.1:3000 landing.png
+
+      - name: Upload E2E evidence
+        id: evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-evidence
+          path: |
+            src/frontend/playwright-report/
+            src/frontend/test-results/
+            src/frontend/landing.png
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Summarise the run
+        if: always()
+        run: |
+          {
+            echo "## End-to-end validation"
+            echo
+            echo "Result: \`${{ job.status }}\`"
+            echo
+            echo "Covered: create a task, mark a task done, delete a task."
+          } >> "$GITHUB_STEP_SUMMARY"
 
 
- # ---- Deploy ----
+  # ---- Agent Review (Domain 5) ----
+  # Parallel agent analysis on every pull request. Each agent runs in its own
+  # leg of the matrix and uploads its report as an artifact for consolidation.
+  agent-review:
+    needs: [build-and-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      copilot-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [reviewer, security-scanner, auditor]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot
+
+      - name: Run ${{ matrix.agent }} Agent
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          copilot --agent=${{ matrix.agent }} \
+            -p "Analyze the changes in this PR. Focus on your specialization area. Report findings with severity and file paths." \
+            --no-ask-user > "${{ matrix.agent }}-report.md"
+
+      - name: Upload Agent Report
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.agent }}-report
+          path: ${{ matrix.agent }}-report.md
+          retention-days: 7
+          if-no-files-found: error
+
+
+  # ---- Consolidate agent findings ----
+  # Waits for all parallel review and scan jobs, then uses Copilot to produce
+  # one executive summary from the collected report artifacts.
+  consolidate:
+    needs: [dependency-review, agent-review, security-scan, e2e-test]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      copilot-requests: write
+    steps:
+      - name: Download All Reports
+        uses: actions/download-artifact@v8
+        with:
+          path: reports/
+
+      - name: Normalize Reports Directory Permissions
+        run: |
+          mkdir -p reports
+          chmod -R u+rwX reports
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot
+
+      - name: AI-Consolidated Summary
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          copilot -p "Read the report files already present under ./reports/ and return only a concise Markdown executive summary for the pull request comment. Begin directly with a level-two heading. Do not wrap the response in a Markdown code fence. Do not create files or run shell commands. Include: overall risk level, blocking issues, advisory items, and a merge recommendation." \
+            --allow-tool='read,search' \
+            --silent \
+            --stream=off \
+            --no-ask-user > reports/executive-summary.md
+
+      - name: Upload Consolidated Summary
+        uses: actions/upload-artifact@v7
+        with:
+          name: executive-summary
+          path: reports/executive-summary.md
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Write Step Summary
+        run: |
+          {
+            echo "## 🤖 Agentic CI Consolidated Report"
+            echo ""
+            cat reports/executive-summary.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+  # ---- Publish consolidated summary to PR ----
+  publish-summary:
+    needs: [consolidate]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Download Consolidated Summary
+        uses: actions/download-artifact@v8
+        with:
+          name: executive-summary
+          path: reports/
+
+      - name: Post Summary to PR
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('reports/executive-summary.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## 🤖 Agentic CI Summary\n\n${summary}`
+            });
+
+
+  # ---- Deploy ----
   # `environment: production` is the approval gate. That environment carries a
   # required-reviewer rule, so this job waits for a human before it touches
   # Azure. See lab-preparation.md.
   deploy:
-    needs: [build-and-test, security-scan, dependency-review]
+    needs: [build-and-test, security-scan, dependency-review, e2e-test, consolidate]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
