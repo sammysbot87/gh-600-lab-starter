@@ -63,3 +63,4 @@ This is a community learning resource and is not an official GitHub exam guide. 
 
 > [!NOTE]
 > This sample application and its infrastructure are provided for demonstration and educational purposes only. They are intended to help learners understand the concepts and workflows behind agentic application development and are not designed or validated for production use.
+# GH-600 Lab — sammysbot87 fork
